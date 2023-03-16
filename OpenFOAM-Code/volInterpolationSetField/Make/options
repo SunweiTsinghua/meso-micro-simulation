@@ -1,0 +1,15 @@
+EXE_INC = \
+    -I$(LIB_SRC)/finiteVolume/lnInclude \
+    -I$(LIB_SRC)/TurbulenceModels/turbulenceModels/lnInclude \
+    -I$(LIB_SRC)/TurbulenceModels/incompressible/lnInclude \
+    -I$(LIB_SRC)/transportModels \
+    -I$(LIB_SRC)/transportModels/incompressible/singlePhaseTransportModel \
+    -I$(LIB_SRC)/meshTools/lnInclude \
+    -I$(WM_PROJECT_USER_DIR)/src/threeDimensionalInterpolation/lnInclude
+
+EXE_LIBS = \
+    -lincompressibleTurbulenceModels \
+    -lincompressibleTransportModels \
+    -lfiniteVolume \
+    -lmeshTools \
+    -L$(WM_PROJECT_USER_DIR)/platforms/linux64GccDPInt32Opt/lib -lThreeDimensionalInterpolation

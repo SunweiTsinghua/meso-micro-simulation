@@ -1,0 +1,1592 @@
+diff -Naur share/input_wrf.F ../wrf/share/input_wrf.F
+--- share/input_wrf.F	2023-03-15 16:36:10.541254707 +0800
++++ ../wrf/share/input_wrf.F	2023-03-15 17:01:18.093514987 +0800
+@@ -1820,6 +1820,21 @@
+ 
+ #if (DA_CORE != 1)
+     CALL wrf_tsin( grid , ierr )
++
++    ! initialize the precice interface variables
++
++    grid%precice_coupled = .FALSE.
++    grid%precice_created = .FALSE.
++    grid%precice_finalized = .FALSE.
++    grid%precice_initialized = .FALSE.
++    grid%precice_write_wind_id = -1
++    grid%precice_write_pressure_id = -1
++    grid%precice_write_tke_id = -1
++    grid%precice_write_temperature_id = -1
++    grid%precice_write_epsilon_id = -1
++
++    INQUIRE(FILE='precice.nml', exist=grid%precice_coupled)
++
+ #if (EM_CORE == 1)
+     if (config_flags%track_loc_in > 0 ) then
+        call track_input( grid , ierr )
+diff -Naur share/Makefile ../wrf/share/Makefile
+--- share/Makefile	2023-03-15 16:36:10.541254707 +0800
++++ ../wrf/share/Makefile	2023-03-15 17:01:18.093514987 +0800
+@@ -67,6 +67,7 @@
+         module_trajectory.o             \
+         bobrand.o                       \
+         wrf_timeseries.o                \
++        wrf_precice.o                   \
+         track_driver.o                  \
+         wrf_fddaobs_in.o                \
+         mediation_nest_move.o           \
+diff -Naur share/mediation_integrate.F ../wrf/share/mediation_integrate.F
+--- share/mediation_integrate.F	2023-03-15 16:36:10.545255013 +0800
++++ ../wrf/share/mediation_integrate.F	2023-03-15 17:01:18.093514987 +0800
+@@ -418,6 +418,7 @@
+    USE module_domain    , ONLY : domain
+    USE module_timing
+    USE module_configure , ONLY : grid_config_rec_type
++   USE module_configure , ONLY : model_config_rec     
+   ! Model layer
+ 
+    IMPLICIT NONE
+@@ -429,6 +430,15 @@
+    ! Compute time series variables
+    CALL calc_ts(grid)
+ 
++   ! Implement the precice coupling
++   IF( grid%id .EQ. model_config_rec%max_dom ) THEN
++
++      IF ( grid%precice_coupled .AND. .NOT. grid%precice_finalized) THEN
++         CALL wrf_precice_initialize_advance( grid, grid%dt )
++      END IF
++      
++   END IF
++
+    ! Compute track variables 
+    CALL track_driver(grid)
+ 
+diff -Naur share/mediation_wrfmain.F ../wrf/share/mediation_wrfmain.F
+--- share/mediation_wrfmain.F	2023-03-15 16:36:10.545255013 +0800
++++ ../wrf/share/mediation_wrfmain.F	2023-03-15 17:01:18.093514987 +0800
+@@ -231,6 +231,11 @@
+ #    include "shutdown_closes.inc"
+      grid_ptr => grid
+      DO WHILE ( ASSOCIATED( grid_ptr ) )
++
++      IF (grid_ptr%id .EQ. model_config_rec%max_dom) THEN
++        IF (grid_ptr%precice_coupled .AND. .NOT. grid%precice_finalized) CALL wrf_precice_finalize(grid_ptr)
++      END IF
++
+        DO kid = 1, max_nests
+          IF ( ASSOCIATED( grid_ptr%nests(kid)%ptr ) ) THEN
+            CALL med_shutdown_io_recurse ( grid_ptr%nests(kid)%ptr, config_flags )
+diff -Naur share/start_domain.F ../wrf/share/start_domain.F
+--- share/start_domain.F	2023-03-15 16:36:10.549255319 +0800
++++ ../wrf/share/start_domain.F	2023-03-15 17:01:18.093514987 +0800
+@@ -28,6 +28,11 @@
+          TYPE (domain) :: grid
+       END SUBROUTINE calc_ts_locations
+ 
++      SUBROUTINE wrf_precice_initialize  ( grid )
++         USE module_domain
++         TYPE (domain) :: grid
++      END SUBROUTINE wrf_precice_initialize
++
+       SUBROUTINE calc_track_locations( grid )
+          USE module_domain
+          TYPE (domain) :: grid
+@@ -68,6 +73,15 @@
+ #endif
+ 
+ #if (DA_CORE != 1)
++
++   IF( grid%id .EQ. model_config_rec%max_dom ) THEN
++
++      IF ( grid%precice_coupled .AND. .NOT. grid%precice_created ) THEN
++         CALL wrf_precice_create( grid )
++      END IF
++      
++   ENDIF
++
+    CALL calc_ts_locations( grid )
+    CALL calc_track_locations( grid )
+ #endif
+diff -Naur share/wrf_precice.F ../wrf/share/wrf_precice.F
+--- share/wrf_precice.F	1970-01-01 08:00:00.000000000 +0800
++++ ../wrf/share/wrf_precice.F	2023-03-15 17:01:18.093514987 +0800
+@@ -0,0 +1,1478 @@
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++! This module is to couple the simulation run by the WRF framework with the other
++! codes for the detailed flow simulation, mainly for the CFD code aiming the simulation
++! of the detailed flow structures
++!
++! Sunwei, Li -- 12 Sept 2021
++
++! ability to couple with the other code in which the boundary patches are defined
++! according to the lat/lon of the WRF grid
++! 
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++
++   SUBROUTINE wrf_read_precice_config(config_name, xml_name, &
++                                      participant_name, mesh_name, write_init, init_directory, exchange_data, &
++                                      lats, lons, cornerx, cornery, height, &
++                                      start_mins, Cmu, has_lid)
++
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   ! The subroutine to read the key information contained in the main file
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   
++      CHARACTER(LEN=*), INTENT(IN)                                   :: config_name
++      CHARACTER(LEN=*), INTENT(OUT)                                  :: xml_name, participant_name, mesh_name
++      CHARACTER(LEN=*), INTENT(OUT), DIMENSION(:), ALLOCATABLE       :: exchange_data
++      REAL, INTENT(INOUT), DIMENSION(2)                              :: lons, lats, cornerx, cornery
++      REAL, INTENT(INOUT)                                            :: height, Cmu, start_mins
++      LOGICAL, INTENT(INOUT)                                         :: write_init, has_lid
++      CHARACTER(LEN=*), INTENT(INOUT)                                :: init_directory
++
++      INTEGER, EXTERNAL                                              :: get_unused_unit      
++      INTEGER                                                        :: iunit, isstatus
++      INTEGER                                                        :: num_data, ii
++
++      NAMELIST /precice_config/ xml_name, participant_name, mesh_name, num_data, write_init, init_directory
++      NAMELIST /coupling_config/ exchange_data, lons, lats, cornerx, cornery, height, start_mins, Cmu, has_lid
++      
++      iunit = get_unused_unit()
++   
++      IF ( iunit <= 0 ) THEN
++         CALL wrf_error_fatal("Error in wrf_read_precice_config: could not find a free Fortran unit.")
++      END IF   
++   
++      OPEN(UNIT=iunit, FILE=config_name, FORM='formatted', STATUS='old', IOSTAT=istatus)
++   
++      IF (istatus == 0) THEN
++         READ(UNIT=iunit, FMT='(1X)')
++         READ(UNIT=iunit, NML=precice_config)
++
++         ALLOCATE(exchange_data(num_data))
++         READ(UNIT=iunit, NML=coupling_config)
++      END IF
++
++      CLOSE(UNIT=iunit)
++   
++   END SUBROUTINE wrf_read_precice_config
++   
++   SUBROUTINE wrf_precice_create ( grid )
++   
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   ! The subroutine to create the precice coupling interface
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++
++      USE module_dm
++      USE module_domain
++      USE module_utility
++   
++      IMPLICIT NONE
++   
++      TYPE(domain), INTENT(INOUT)                  :: grid
++   
++      LOGICAL, EXTERNAL                            :: wrf_dm_on_monitor
++      INTEGER, EXTERNAL                            :: get_unused_unit
++   
++      CHARACTER(LEN=1024)                          :: precice_xml_name, precice_participant, precice_mesh
++      CHARACTER(LEN=50), DIMENSION(:), ALLOCATABLE :: exchange_data 
++      CHARACTER(LEN=50)                            :: precice_write_initial_data, precice_read_check_point, precice_write_check_point
++      CHARACTER(LEN=1024)                          :: message
++   
++      DOUBLE PRECISION                             :: precice_time_step, wrf_time_step
++      TYPE(WRFU_TimeInterval)                      :: tmpTimeInterval
++      INTEGER                                      :: precice_rank, precice_commsize, wrf_mpi_comm, mpi_comm_err
++      INTEGER                                      :: precice_dims, precice_num_data
++      DOUBLE PRECISION, DIMENSION(:), ALLOCATABLE  :: precice_vertices
++      INTEGER, DIMENSION(:), ALLOCATABLE           :: precice_vertex_ids
++      INTEGER                                      :: ii, jj, temp_id, istatus, iunit, flag_write_data, rc
++      INTEGER, PARAMETER                           :: precision = 100
++      INTEGER                                      :: dt, dt_num, dt_den
++
++      INTERFACE
++         SUBROUTINE  wrf_read_precice_config (config_name, xml_name, &
++                                              participant_name, mesh_name, write_init, init_directory, exchange_data, &
++                                              lats, lons, cornerx, cornery, height, &
++                                              start_mins, Cmu, has_lid)
++            CHARACTER(LEN=*)                                :: config_name
++            CHARACTER(LEN=*)                                :: xml_name, participant_name, mesh_name
++            CHARACTER(LEN=*), DIMENSION(:), ALLOCATABLE     :: exchange_data
++            LOGICAL                                         :: write_init, has_lid
++            CHARACTER(LEN=*)                                :: init_directory
++            REAL, DIMENSION(2)                              :: lons, lats, cornerx, cornery
++            REAL                                            :: height, Cmu, start_mins        
++         END SUBROUTINE
++      END INTERFACE
++   
++#if ((EM_CORE == 1) && (DA_CORE != 1))
++      IF ( grid%dfi_opt == DFI_NODFI .OR. (grid%dfi_opt /= DFI_NODFI .AND. grid%dfi_stage == DFI_SETUP) ) THEN
++#endif
++     
++         IF ( wrf_dm_on_monitor() ) THEN
++
++            CALL wrf_read_precice_config( 'precice.nml', precice_xml_name, &
++                                           precice_participant, precice_mesh, grid%write_init, grid%init_directory, exchange_data, &
++                                           grid%precice_lats, grid%precice_lons, grid%precice_cornerx, grid%precice_cornery, grid%precice_height, &
++                                           grid%precice_xmins, grid%precice_Cmu, grid%precice_lid )       
++         END IF
++
++#ifdef DM_PARALLEL
++
++         CALL wrf_dm_bcast_string ( precice_xml_name, 1024 )
++         CALL wrf_dm_bcast_string ( precice_participant, 1024 )
++         CALL wrf_dm_bcast_string ( precice_mesh, 1024 )
++         CALL wrf_dm_bcast_string ( grid%init_directory, LEN(grid%init_directory) )
++
++         CALL wrf_dm_bcast_logical ( grid%write_init, 1 )
++         CALL wrf_dm_bcast_logical ( grid%precice_lid, 1 )
++
++         CALL wrf_dm_bcast_real( grid%precice_lats, 2 )
++         CALL wrf_dm_bcast_real( grid%precice_lons, 2 )
++         CALL wrf_dm_bcast_real( grid%precice_cornerx, 2 )
++         CALL wrf_dm_bcast_real( grid%precice_cornery, 2 )
++         CALL wrf_dm_bcast_real( grid%precice_xmins, 1 )
++         CALL wrf_dm_bcast_real( grid%precice_Cmu, 1 )   
++         CALL wrf_dm_bcast_real( grid%precice_height, 1)   
++
++         CALL wrf_get_dm_communicator( wrf_mpi_comm )
++         CALL MPI_Comm_rank( wrf_mpi_comm, precice_rank, mpi_comm_err )
++         CALL MPI_Comm_size( wrf_mpi_comm, precice_commsize, mpi_comm_err )
++
++         IF ( mpi_comm_err /= MPI_SUCCESS ) THEN
++            WRITE( message, '(A)') '[wrf-precice-err] : [Initialization] : fail to get the MPI rank and/or size for precice coupling'
++            CALL wrf_error_fatal( message )
++         END IF
++#else
++         precice_rank = 0
++         precice_commsize = 1
++#endif
++
++         CALL precicef_create( TRIM(precice_participant), TRIM(precice_xml_name), precice_rank, precice_commsize )         
++
++         WRITE( message, '(A, I4, A, I4)' ) '[wrf-precice-info] : [Initialization] : Calling the precice create subroutine from rank ', &
++                                             precice_rank, ' of comm size ', precice_commsize
++         CALL wrf_message(message)
++
++         CALL precicef_get_dims(precice_dims)
++
++         grid%have_calculated_precice_vertices = .FALSE.   
++         CALL wrf_precice_calc_vertices( grid )
++         
++         precice_write_initial_data  = '                                                  '
++         precice_read_check_point    = '                                                  '
++         precice_write_check_point   = '                                                  '
++
++         ALLOCATE( precice_vertices(grid%precice_interface_number_vertices*precice_dims) )
++         ALLOCATE( precice_vertex_ids(grid%precice_interface_number_vertices) )                   
++
++         DO ii = 1, grid%precice_interface_number_vertices
++            DO jj = 1, precice_dims
++               precice_vertices((ii-1)*precice_dims + jj) = grid%precice_interface_vertices(ii,jj)
++            END DO
++         END DO
++         
++         CALL precicef_set_vertices( grid%precice_interface_id, grid%precice_interface_number_vertices, precice_vertices, precice_vertex_ids)
++
++         DO ii = 1, grid%precice_interface_number_vertices
++            grid%precice_interface_vertex_ids(ii) = precice_vertex_ids(ii)
++         END DO
++
++         WRITE( message, '(A, I4, A, I4, A, I4)' ) '[wrf-precice-info] : [Initialization] : Initializing the precice coupling interface vertices and exchange data calculations from rank ', &
++                                                   precice_rank, ' of comm size ', precice_commsize, ' with the precice interface id of ', grid%precice_interface_id
++         CALL wrf_message(message)
++
++         grid%precice_created = .TRUE.
++
++         DEALLOCATE(precice_vertices)
++         DEALLOCATE(precice_vertex_ids)
++
++         IF ( wrf_dm_on_monitor() ) THEN
++         
++            precice_num_data = SIZE(exchange_data)
++
++            DO ii = 1, precice_num_data
++               IF (TRIM(exchange_data(ii)) .EQ. "Velocity") THEN             
++                  CALL precicef_get_data_id( 'Velocity', grid%precice_interface_id, grid%precice_write_wind_id )
++                  
++               ELSE IF (TRIM(exchange_data(ii)) .EQ. "Pressure") THEN
++                  CALL precicef_get_data_id('Pressure', grid%precice_interface_id, grid%precice_write_pressure_id )
++
++               ELSE IF (TRIM(exchange_data(ii)) .EQ. "Temperature") THEN
++                  CALL precicef_get_data_id( 'Temperature', grid%precice_interface_id, grid%precice_write_temperature_id )
++
++               ELSE IF (TRIM(exchange_data(ii)) .EQ. "TKE") THEN
++                  CALL precicef_get_data_id( 'TKE', grid%precice_interface_id, grid%precice_write_tke_id )
++
++               ELSE IF (TRIM(exchange_data(ii)) .EQ. "DissipationRate") THEN
++                  CALL precicef_get_data_id( 'DissipationRate', grid%precice_interface_id, grid%precice_write_epsilon_id )
++
++               ELSE
++                  WRITE( message, '(A, A, A)' ) '[wrf-precice-error] : [Initialization] :  the exchange data of ', TRIM(exchange_data(ii)), ' is currently not supported by WRF-precice coupling module'
++                  CALL wrf_error_fatal(message)
++
++               ENDIF             
++            ENDDO
++
++         END IF
++
++#ifdef DM_PARALLEL
++         CALL wrf_dm_bcast_integer ( grid%precice_write_wind_id, 1 )
++         CALL wrf_dm_bcast_integer ( grid%precice_write_pressure_id, 1 )
++         CALL wrf_dm_bcast_integer ( grid%precice_write_temperature_id, 1)
++         CALL wrf_dm_bcast_integer ( grid%precice_write_tke_id, 1 )
++         CALL wrf_dm_bcast_integer ( grid%precice_write_epsilon_id, 1 )
++#endif
++
++#if ((EM_CORE == 1) && (DA_CORE != 1))
++      END IF
++#endif
++   
++   END SUBROUTINE wrf_precice_create
++   
++   SUBROUTINE wrf_precice_calc_vertices (grid)
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   ! The subroutine to calculate the vertices coordinates for the precice coupling interface
++   ! for further data exchanges according to the lat/lon of the coupling interface
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   
++      USE module_domain, ONLY : domain, get_ijk_from_grid
++      USE module_configure, ONLY : model_config_rec, grid_config_rec_type, model_to_grid_config_rec
++      USE module_dm, ONLY : wrf_dm_max_int, wrf_dm_min_real, wrf_dm_min_reals
++      USE module_llxy
++      USE module_state_description
++      USE module_model_constants
++   
++      IMPLICIT NONE
++   
++      ! the input argument to calculate the vertices for precie
++      TYPE(domain), INTENT(INOUT)         :: grid
++   
++      ! external subroutines and functions
++      LOGICAL, EXTERNAL                   :: wrf_dm_on_monitor
++      INTEGER, EXTERNAL                   :: get_unused_unit
++   
++      ! local variables
++      INTEGER                             :: ii, jj, kk, ix, iy, iz, num_vertices, corner_level
++      INTEGER                             :: ix1, ix2, iy1, iy2, iunit
++      INTEGER                             :: ids, ide, jds, jde, kds, kde,        &
++                                             ims, ime, jms, jme, kms, kme,        &
++                                             ips, ipe, jps, jpe, kps, kpe,        &
++                                             imsx, imex, jmsx, jmex, kmsx, kmex,  &
++                                             ipsx, ipex, jpsx, jpex, kpsx, kpex,  &
++                                             imsy, imey, jmsy, jmey, kmsy, kmey,  &
++                                             ipsy, ipey, jpsy, jpey, kpsy, kpey
++   
++      REAL                                :: precice_rx1, precice_rx2, precice_ry1, precice_ry2
++      REAL                                :: cz1, cz2, cz0
++      REAL                                :: known_lat, known_lon
++      REAL, DIMENSION(:,:), ALLOCATABLE   :: buf
++
++      CHARACTER(LEN=1024)                 :: message
++   
++      TYPE (PROJ_INFO)                    :: precice_proj
++      TYPE (grid_config_rec_type)         :: config_flags
++   
++#if ((EM_CORE == 1) && (DA_CORE != 1))
++      IF ( grid%dfi_stage == DFI_FST ) THEN
++#endif
++         CALL get_ijk_from_grid ( grid ,                               &
++                                  ids, ide, jds, jde, kds, kde,        &
++                                  ims, ime, jms, jme, kms, kme,        &
++                                  ips, ipe, jps, jpe, kps, kpe,        &
++                                  imsx, imex, jmsx, jmex, kmsx, kmex,  &
++                                  ipsx, ipex, jpsx, jpex, kpsx, kpex,  &
++                                  imsy, imey, jmsy, jmey, kmsy, kmey,  &
++                                  ipsy, ipey, jpsy, jpey, kpsy, kpey )
++      
++         CALL model_to_grid_config_rec ( grid%id , model_config_rec , config_flags )
++      
++         ! Set up map transformation structure
++         CALL map_init( precice_proj )
++      
++         IF (ips <= 1 .AND. 1 <= ipe .AND. jps <= 1 .AND. 1 <= jpe) THEN
++#if(NMM_CORE==1)
++            known_lat = grid%hlat(1,1)
++            known_lon = grid%hlon(1,1)
++#else
++            known_lat = grid%xlat(1,1)
++            known_lon = grid%xlong(1,1)
++#endif
++         ELSE
++            known_lat = 9999.
++            known_lon = 9999.
++         END IF
++
++#ifdef DM_PARALLEL
++         known_lat = wrf_dm_min_real(known_lat)
++         known_lon = wrf_dm_min_real(known_lon)
++#endif
++      
++         ! Mercator
++         IF (config_flags%map_proj == PROJ_MERC) THEN
++            CALL map_set(PROJ_MERC, precice_proj,          &
++                         truelat1 = config_flags%truelat1, &
++                         lat1     = known_lat,             &
++                         lon1     = known_lon,             &
++                         knowni   = 1.,                    &
++                         knownj   = 1.,                    &
++                         dx       = config_flags%dx)
++      
++         ! Lambert conformal
++         ELSE IF (config_flags%map_proj == PROJ_LC) THEN
++            CALL map_set(PROJ_LC, precice_proj,             &
++                         truelat1 = config_flags%truelat1,  &
++                         truelat2 = config_flags%truelat2,  &
++                         stdlon   = config_flags%stand_lon, &
++                         lat1     = known_lat,              &
++                         lon1     = known_lon,              &
++                         knowni   = 1.,                     &
++                         knownj   = 1.,                     &
++                         dx       = config_flags%dx)
++      
++         ! Polar stereographic
++         ELSE IF (config_flags%map_proj == PROJ_PS) THEN
++            CALL map_set(PROJ_PS, precice_proj,             &
++                         truelat1 = config_flags%truelat1,  &
++                         stdlon   = config_flags%stand_lon, &
++                         lat1     = known_lat,              &
++                         lon1     = known_lon,              &
++                         knowni   = 1.,                     &
++                         knownj   = 1.,                     &
++                         dx       = config_flags%dx)
++      
++#if (EM_CORE == 1)
++         ! Cassini (global ARW)
++         ELSE IF (config_flags%map_proj == PROJ_CASSINI) THEN
++            CALL map_set(PROJ_CASSINI, precice_proj,                       &
++                         latinc   = grid%dy*360.0/(2.0*EARTH_RADIUS_M*PI), &
++                         loninc   = grid%dx*360.0/(2.0*EARTH_RADIUS_M*PI), & 
++                         lat1     = known_lat,                             &
++                         lon1     = known_lon,                             &
++                         lat0     = config_flags%pole_lat,                 &
++                         lon0     = config_flags%pole_lon,                 &
++                         knowni   = 1.,                                    &
++                         knownj   = 1.,                                    &
++                         stdlon   = config_flags%stand_lon)
++#endif
++   
++         ! Rotated latitude-longitude
++         ELSE IF (config_flags%map_proj == PROJ_ROTLL) THEN
++            CALL map_set(PROJ_ROTLL, precice_proj,                 &
++                         ixdim    = grid%e_we-1,                   &
++                         jydim    = grid%e_sn-1,                   &
++                         phi      = real(grid%e_sn-2)*grid%dy/2.0, &
++                         lambda   = real(grid%e_we-2)*grid%dx,     &
++                         lat1     = config_flags%cen_lat,          &
++                         lon1     = config_flags%cen_lon,          &
++                         latinc   = grid%dy,                       &
++                         loninc   = grid%dx,                       &
++                         stagger  = HH)
++      
++         END IF
++         
++         ! Determine the vertices for the precice coupling
++   
++         IF (.NOT. grid%have_calculated_precice_vertices) THEN
++   
++            grid%have_calculated_precice_vertices = .TRUE.
++      
++            CALL latlon_to_ij(precice_proj, grid%precice_lats(1), grid%precice_lons(1), precice_rx1, precice_ry1)
++            CALL latlon_to_ij(precice_proj, grid%precice_lats(2), grid%precice_lons(2), precice_rx2, precice_ry2)
++
++            grid%precice_iloc(1) = precice_rx1
++            grid%precice_iloc(2) = precice_rx2
++            grid%precice_jloc(1) = precice_ry1
++            grid%precice_jloc(2) = precice_ry2    
++
++            IF (grid%precice_iloc(1) < ids .OR. grid%precice_iloc(2) > ide .OR. &
++                grid%precice_jloc(1) < jds .OR. grid%precice_jloc(2) > jde) THEN
++
++               WRITE( message, '(A,A,F8.3,2X,F8.3,A,F8.3,2X,F8.3,A)' ) &
++               '[wrf-precice-error] : [Initialization] : ', &
++               'one or two the precice corner of ( ', grid%precice_lats(1), grid%precice_lons(1), ' ) and/or ( ', grid%precice_lats(2), grid%precice_lons(2), ' ) is out of the domain'
++
++               CALL wrf_error_fatal( message )
++
++            END IF
++
++            corner_level = 0
++
++            DO ix = 1, 2
++               DO iy = 1, 2
++
++                  IF (grid%precice_iloc(ix) < ips .OR. grid%precice_iloc(ix) > ipe .OR. grid%precice_jloc(iy) < jps .OR. grid%precice_jloc(iy) > jpe) THEN
++                     iz = 0
++                  ELSE
++                     iz = 1
++                     cz0 = 0.0
++
++                     DO WHILE (cz0 < grid%precice_height)
++                        iz = iz + 1
++                        cz1 = grid%phb(grid%precice_iloc(ix),iz,grid%precice_jloc(iy)) + grid%ph_2(grid%precice_iloc(ix),iz,grid%precice_jloc(iy))
++                        cz2 = grid%phb(grid%precice_iloc(ix),iz+1,grid%precice_jloc(iy)) + grid%ph_2(grid%precice_iloc(ix),iz+1,grid%precice_jloc(iy))
++                        cz0 = 0.5*(cz1+cz2)/9.81 - grid%ht(grid%precice_iloc(ix),grid%precice_jloc(iy))
++                     END DO
++                  END IF
++
++                  IF (iz > corner_level) corner_level = iz - 1
++
++               END DO
++            END DO
++
++            grid%precice_level = corner_level
++
++#ifdef DM_PARALLEL
++            grid%precice_level = wrf_dm_max_int( corner_level )
++#endif
++            num_vertices = 1
++
++            DO ii = 1, 2
++               ix = FLOOR(grid%precice_iloc(ii))
++               DO iy = CEILING(grid%precice_jloc(1)), FLOOR(grid%precice_jloc(2))
++
++                  IF (ix < ips .OR. ix > ipe .OR. iy < jps .OR. iy > jpe) THEN
++                     Cycle
++                  END IF
++
++                  DO iz = 1, grid%precice_level
++                     grid%precice_interface_vertices(num_vertices, 1) = grid%precice_cornerx(ii)
++                     grid%precice_interface_vertices(num_vertices, 2) = grid%precice_cornery(1) + grid%dy * (iy-grid%precice_jloc(1))
++                     grid%precice_interface_vertices(num_vertices, 3) = 0.5*((grid%phb(ix,iz,iy)+grid%ph_2(ix,iz,iy))+(grid%phb(ix,iz+1,iy)+grid%ph_2(ix,iz+1,iy)))/9.81 - grid%ht(ix,iy)
++                     num_vertices = num_vertices + 1
++                  END DO
++
++               END DO
++            END DO
++
++            DO jj = 1, 2
++               iy = FLOOR(grid%precice_jloc(jj))
++               DO ix = CEILING(grid%precice_iloc(1)), FLOOR(grid%precice_iloc(2))
++
++                  IF (ix < ips .OR. ix > ipe .OR. iy < jps .OR. iy > jpe) THEN
++                     Cycle
++                  END IF
++
++                  DO iz = 1, grid%precice_level
++                     grid%precice_interface_vertices(num_vertices, 1) = grid%precice_cornerx(1) + grid%dx * (ix-grid%precice_iloc(1))
++                     grid%precice_interface_vertices(num_vertices, 2) = grid%precice_cornery(jj)
++                     grid%precice_interface_vertices(num_vertices, 3) = 0.5*((grid%phb(ix,iz,iy)+grid%ph_2(ix,iz,iy))+(grid%phb(ix,iz+1,iy)+grid%ph_2(ix,iz+1,iy)))/9.81 - grid%ht(ix,iy)
++                     num_vertices = num_vertices + 1
++                  END DO
++
++               END DO
++            END DO
++
++            IF (grid%precice_lid) THEN
++               DO ix = CEILING(grid%precice_iloc(1)), FLOOR(grid%precice_iloc(2))
++                  DO iy = CEILING(grid%precice_jloc(1)), FLOOR(grid%precice_jloc(2))
++
++                     IF (ix < ips .OR. ix > ipe .OR. iy < jps .OR. iy > jpe) THEN
++                        Cycle
++                     END IF
++
++                     grid%precice_interface_vertices(num_vertices, 1) = grid%precice_cornerx(1) + grid%dx * (ix-grid%precice_iloc(1))
++                     grid%precice_interface_vertices(num_vertices, 2) = grid%precice_cornery(1) + grid%dy * (iy-grid%precice_jloc(1))
++                     grid%precice_interface_vertices(num_vertices, 3) = grid%precice_height
++                     num_vertices = num_vertices + 1
++
++                  END DO
++               END DO
++            END IF
++
++            grid%precice_interface_number_vertices = num_vertices - 1
++
++         END IF
++   
++#if ((EM_CORE == 1) && (DA_CORE != 1))
++         END IF
++#endif
++   
++   END SUBROUTINE wrf_precice_calc_vertices
++   
++   SUBROUTINE wrf_precice_calc_init_vertices (grid)
++   
++      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++      ! The subroutine to calculate the vertices coordinates to initialize the points and indices
++      ! of the field inside the WRF domain for precice coupling
++      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++ 
++         USE module_domain
++         USE module_dm, ONLY : wrf_dm_min_reals      
++         USE module_model_constants
++      
++         IMPLICIT NONE
++      
++         ! the input argument to calculate the vertices for precie
++         TYPE(domain), INTENT(INOUT)            :: grid
++
++         ! external subroutines and functions
++         INTEGER, EXTERNAL                      :: get_unused_unit
++         LOGICAL, EXTERNAL                      :: wrf_dm_on_monitor
++      
++         ! local variables
++         INTEGER                                :: ix, iy, iz, nX, nY, nZ, i0, i1, ii, jj
++         INTEGER                                :: iunit, stat
++         REAL                                   :: cz
++         REAL, DIMENSION(:,:,:), ALLOCATABLE    :: ax, ay, az, buf
++         CHARACTER(LEN=1024)                    :: message
++      
++  
++         IF (.NOT. grid%have_calculated_precice_vertices) THEN
++            WRITE( message, '(A)' ) '[wrf-precice-error] : [Initialization] : calculate the vertices before output the initial field'
++            CALL wrf_error_fatal ( message )
++            
++         ELSE
++            nX = CEILING(grid%precice_iloc(2)) - FLOOR(grid%precice_iloc(1)) + 1
++            nY = CEILING(grid%precice_jloc(2)) - FLOOR(grid%precice_jloc(1)) + 1
++            nZ = grid%precice_level + 1
++
++            ALLOCATE( ax(nX, nY, nZ) )
++            ALLOCATE( ay(nX, nY, nZ) )
++            ALLOCATE( az(nX, nY, nZ) )
++
++            DO ix = FLOOR(grid%precice_iloc(1)), CEILING(grid%precice_iloc(2))
++               DO iy = FLOOR(grid%precice_jloc(1)), CEILING(grid%precice_jloc(2))
++
++                  ii = ix - FLOOR(grid%precice_iloc(1)) + 1
++                  jj = iy - FLOOR(grid%precice_jloc(1)) + 1
++
++                  IF (grid%sp31 <= ix .AND. ix <= grid%ep31 .AND. grid%sp33 <= iy .AND. iy <= grid%ep33) THEN
++                     DO iz = 1, nZ
++                        ax(ii, jj, iz) = grid%precice_cornerx(1) + grid%dx * (ix-grid%precice_iloc(1))
++                        ay(ii, jj, iz) = grid%precice_cornery(1) + grid%dy * (iy-grid%precice_jloc(1))
++                        az(ii, jj, iz) = 0.5*((grid%phb(ix,iz,iy)+grid%ph_2(ix,iz,iy))+(grid%phb(ix,iz+1,iy)+grid%ph_2(ix,iz+1,iy)))/9.81 - grid%ht(ix,iy)
++                     END DO
++                  ELSE
++                     ax(ii, jj, :) = 1.E30
++                     ay(ii, jj, :) = 1.E30
++                     az(ii, jj, :) = 1.E30
++                  END IF
++
++               END DO
++            END DO
++
++#ifdef DM_PARALLEL
++            ALLOCATE( buf(nX, nY, nZ) )
++
++            buf(:,:,:) = ax(:,:,:)
++            CALL wrf_dm_min_reals( buf(:,:,:), ax(:,:,:), nX*nY*nZ )
++
++            buf(:,:,:) = ay(:,:,:)
++            CALL wrf_dm_min_reals( buf(:,:,:), ay(:,:,:), nX*nY*nZ )
++
++            buf(:,:,:) = az(:,:,:)
++            CALL wrf_dm_min_reals( buf(:,:,:), az(:,:,:), nX*nY*nZ ) 
++
++            DEALLOCATE( buf )
++#endif
++
++            IF ( wrf_dm_on_monitor() ) THEN
++
++               iunit = get_unused_unit()
++      
++               IF ( iunit <= 0 ) THEN
++                  WRITE( message, '(A)' ) '[wrf-precice-error] :  [Initialization] :  Error in wrf_precice_calc_init_vertices: could not find a free Fortran unit.'               
++                  CALL wrf_error_fatal( message )
++               END IF 
++
++               OPEN(unit=iunit, file=TRIM(grid%init_directory)//'/points', STATUS='REPLACE', IOSTAT=stat)      
++               CALL write_foam_head(iunit, 'vectorField', 'constant/domainData', 'points')
++               WRITE(iunit, '(I6)') nX*nY*nZ
++               WRITE(iunit, '(A)') '('
++
++               DO ix = 1, nX
++                  DO iy = 1,nY
++                     DO iz = 1, nZ
++                        WRITE(iunit, '(4X, A1, F10.4, X, F10.4, X, F10.4, A1)') '(', ax(ix, iy, iz), ay(ix, iy, iz), az(ix, iy, iz), ')'
++                     END DO
++                  END DO
++               END DO
++
++               WRITE(iunit, '(A)') ')' 
++               CLOSE(iunit)
++
++               OPEN(unit=iunit, file=TRIM(grid%init_directory)//'/indices', STATUS='REPLACE', IOSTAT=stat)
++               CALL write_foam_head(iunit, 'labelListList', 'constant/domainData', 'indices')
++               WRITE(iunit, '(I6)') (nX-1)*(nY-1)*(nZ-1)            
++               WRITE(iunit, '(A)') '('
++
++               DO ix = 1, nX-1
++                  DO iy = 1, nY-1
++                     DO iz = 1, nZ-1
++                        i0 = (ix-1)*(nY*nZ) + (iy-1)*nZ + iz
++                        i1 = i0 + 1
++                        WRITE(iunit, '(4X, A1, 8(I6, X), A1)') '(', i0, i0+(nY*nZ), i0+(nY*nZ)+nZ, i0+nZ, i1, i1+(nY*nZ), i1+(nY*nZ)+nZ, i1+nZ, ')'
++                     END DO
++                  END DO
++               END DO
++
++               WRITE(iunit, '(A)') ')'
++               CLOSE(iunit)
++
++            END IF
++
++            DEALLOCATE(ax)
++            DEALLOCATE(ay)
++            DEALLOCATE(az)
++
++         END IF
++      
++   END SUBROUTINE wrf_precice_calc_init_vertices   
++   
++   SUBROUTINE wrf_precice_calc_data( grid )
++   
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   ! The subroutine to calculate the wind velocities and potential temperatures at the 
++   ! precice coupling interface based on the simulation of WRF
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   
++      USE module_domain
++      USE module_dm, ONLY : wrf_dm_min_reals      
++      USE module_configure, ONLY : model_config_rec, grid_config_rec_type, model_to_grid_config_rec
++      USE module_model_constants
++   
++      IMPLICIT NONE
++   
++      ! Arguments
++      TYPE (domain), INTENT(INOUT)           :: grid
++      LOGICAL, EXTERNAL                      :: wrf_dm_on_monitor
++   
++      ! Local variables
++      TYPE (grid_config_rec_type)            :: config_flags
++      INTEGER                                :: ii, jj, ix, iy, iz, idx_vertex
++      INTEGER                                :: ix1, ix2, iy1, iy2, iz1, iz2
++      REAL                                   :: u, v, w, t, h, h1, h2, d0
++      REAL                                   :: curr_pr, curr_p0, curr_h
++
++      CHARACTER(LEN=1024)                    :: message      
++   
++#if ((EM_CORE == 1) && (DA_CORE != 1))
++      IF ( grid%dfi_opt /= DFI_NODFI .AND. grid%dfi_stage /= DFI_FST ) RETURN
++#endif
++   
++      CALL model_to_grid_config_rec ( grid%id , model_config_rec , config_flags )
++
++# if (EM_CORE == 1)
++
++      idx_vertex = 1
++
++      DO ii = 1, 2
++         ix1 = FLOOR(grid%precice_iloc(ii))
++         ix2 = CEILING(grid%precice_iloc(ii))
++         d0 = grid%precice_iloc(ii) - ix1
++         
++         DO iy = CEILING(grid%precice_jloc(1)), FLOOR(grid%precice_jloc(2))
++            DO iz = 1, grid%precice_level
++               IF (grid%sp31 <= ix1 .AND. ix1 <= grid%ep31 .AND. grid%sp33 <= iy .AND. iy <= grid%ep33) THEN
++
++                  IF (grid%sp31 <= ix2 .AND. ix2 <= grid%ep31) THEN
++                     CALL wrf_interp(grid, config_flags%precice_unstagger_winds, ix1, ix2, iy, iz, d0, idx_vertex, 1)
++                  ELSE
++                     CALL wrf_interp(grid, config_flags%precice_unstagger_winds, ix1, ix1, iy, iz, 0.0, idx_vertex, 1)
++                  END IF
++   
++               END IF
++            END DO
++         END DO
++      END DO
++
++      DO jj = 1, 2
++         iy1 = FLOOR(grid%precice_jloc(jj))
++         iy2 = CEILING(grid%precice_jloc(jj))
++         d0 = grid%precice_jloc(jj) - iy1
++
++         DO ix = CEILING(grid%precice_iloc(1)), FLOOR(grid%precice_jloc(2))
++            DO iz = 1, grid%precice_level
++               IF (grid%sp31 <= ix .AND. ix <= grid%ep31 .AND. grid%sp33 <= iy1 .AND. iy1 <= grid%ep33) THEN
++
++                  IF (grid%sp33 <= iy2 .AND. iy2 <= grid%ep33) THEN
++                     CALL wrf_interp(grid, config_flags%precice_unstagger_winds, iy1, iy2, ix, iz, d0, idx_vertex, 2)
++                  ELSE
++                     CALL wrf_interp(grid, config_flags%precice_unstagger_winds, iy1, iy1, ix, iz, 0.0, idx_vertex, 2)
++                  END IF
++   
++               END IF
++            END DO
++         END DO
++      END DO
++
++      IF (grid%precice_lid) THEN
++
++         DO ix = CEILING(grid%precice_iloc(1)), FLOOR(grid%precice_iloc(2))
++            DO iy = CEILING(grid%precice_jloc(1)), FLOOR(grid%precice_jloc(2))
++               IF (grid%sp31 <= ix .AND. ix <= grid%ep31 .AND. grid%sp33 <= iy .AND. iy <= grid%ep33) THEN
++                  iz1 = grid%precice_level
++                  iz2 = grid%precice_level + 1
++                  h1 = 0.5*((grid%phb(ix,iz1,iy)+grid%ph_2(ix,iz1,iy))+(grid%phb(ix,iz1+1,iy)+grid%ph_2(ix,iz1+1,iy)))/9.81 - grid%ht(ix,iy)
++                  h2 = 0.5*((grid%phb(ix,iz2,iy)+grid%ph_2(ix,iz2,iy))+(grid%phb(ix,iz2+1,iy)+grid%ph_2(ix,iz2+1,iy)))/9.81 - grid%ht(ix,iy)
++                  d0 = (grid%precice_height-h1) / (h2-h1)
++
++                  CALL wrf_interp(grid, config_flags%precice_unstagger_winds, iz1, iz2, ix, iy, d0, idx_vertex, 3)
++               END IF
++            END DO
++         END DO
++
++      END IF
++
++#endif
++
++   END SUBROUTINE wrf_precice_calc_data
++
++   SUBROUTINE wrf_interp( grid, unstager, i1, i2, jj, kk, x0, id, dir)
++      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++      ! The subroutine to interpolate the wind and other variables at the east and west
++      ! boundaries of the precice domain
++      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++
++      USE module_domain
++      USE module_model_constants
++
++      IMPLICIT NONE
++
++      TYPE (domain), INTENT(INOUT)                    :: grid
++      INTEGER, INTENT(INOUT)                          :: id
++
++      LOGICAL, INTENT(IN)                             :: unstager
++      INTEGER, INTENT(IN)                             :: i1, i2, jj, kk, dir
++      REAL, INTENT(IN)                                :: x0
++
++      REAL, PARAMETER                                 :: kappa = 0.4
++      INTEGER                                         :: ix1, ix2, iy1, iy2, iz1, iz2
++      REAL                                            :: d0
++      REAL                                            :: u1, v1, w1, p1, k1, e1, t1, h1, p01
++      REAL                                            :: u2, v2, w2, p2, k2, e2, t2, h2, p02  
++
++      ! set up the indices of the data matrix
++      SELECT CASE (dir)
++         CASE (1)
++            ix1 = i1
++            ix2 = i2
++            iy1 = jj
++            iy2 = jj
++            iz1 = kk
++            iz2 = kk
++         CASE (2)
++            ix1 = jj
++            ix2 = jj
++            iy1 = i1
++            iy2 = i2
++            iz1 = kk
++            iz2 = kk
++         CASE (3)
++            ix1 = jj
++            ix2 = jj
++            iy1 = kk
++            iy2 = kk
++            iz1 = i1
++            iz2 = i2
++      END SELECT
++
++      ! interpolate the wind velocities
++      IF (grid%precice_write_wind_id .GE. 0) THEN
++         IF (unstager) THEN
++
++            u1 = ((grid%u_2(ix1,iz1,iy1)*grid%cosa(ix1,iy1)-grid%v_2(ix1,iz1,iy1)*grid%sina(ix1,iy1)) + (grid%u_2(ix1+1,iz1,iy1)*grid%cosa(ix1+1,iy1)-grid%v_2(ix1+1,iz1,iy1)*grid%sina(ix1+1,iy1)))/2.0 
++            v1 = ((grid%v_2(ix1,iz1,iy1)*grid%cosa(ix1,iy1)+grid%u_2(ix1,iz1,iy1)*grid%sina(ix1,iy1)) + (grid%v_2(ix1,iz1,iy1+1)*grid%cosa(ix1,iy1+1)+grid%u_2(ix1,iz1,iy1+1)*grid%sina(ix1,iy1+1)))/2.0
++            w1 = (grid%w_2(ix1,iz1,iy1)+grid%w_2(ix1,iz1+1,iy1))/2.0
++
++            u2 = ((grid%u_2(ix2,iz2,iy2)*grid%cosa(ix2,iy2)-grid%v_2(ix2,iz2,iy2)*grid%sina(ix2,iy2)) + (grid%u_2(ix2+1,iz2,iy2)*grid%cosa(ix2+1,iy2)-grid%v_2(ix2+1,iz2,iy2)*grid%sina(ix2+1,iy2)))/2.0 
++            v2 = ((grid%v_2(ix2,iz2,iy2)*grid%cosa(ix2,iy2)+grid%u_2(ix2,iz2,iy2)*grid%sina(ix2,iy2)) + (grid%v_2(ix2,iz2,iy2+1)*grid%cosa(ix2,iy2+1)+grid%u_2(ix2,iz2,iy2+1)*grid%sina(ix2,iy2+1)))/2.0
++            w2 = (grid%w_2(ix2,iz2,iy2)+grid%w_2(ix2,iz2+1,iy2))/2.0
++
++         ELSE
++
++            u1 = grid%u_2(ix1,iz1,iy1)*grid%cosa(ix1,iy1)-grid%v_2(ix1,iz1,iy1)*grid%sina(ix1,iy1)
++            v1 = grid%v_2(ix1,iz1,iy1)*grid%cosa(ix1,iy1)+grid%u_2(ix1,iz1,iy1)*grid%sina(ix1,iy1)
++            w1 = grid%w_2(ix1,iz1,iy1)
++
++            u2 = grid%u_2(ix2,iz2,iy2)*grid%cosa(ix2,iy2)-grid%v_2(ix2,iz2,iy2)*grid%sina(ix2,iy2)
++            v2 = grid%v_2(ix2,iz2,iy2)*grid%cosa(ix2,iy2)+grid%u_2(ix2,iz2,iy2)*grid%sina(ix2,iy2)
++            w2 = grid%w_2(ix2,iz2,iy2)
++
++         END IF
++
++         grid%precice_wu(id) = u1*(1.0-x0) + u2*x0
++         grid%precice_wv(id) = v1*(1.0-x0) + v2*x0
++         grid%precice_ww(id) = w1*(1.0-x0) + w2*x0
++      END IF
++
++      ! interpolate the pressure
++      IF (grid%precice_write_pressure_id .GE. 0) THEN
++         p1 = grid%p(ix1,iz1,iy1) + grid%pb(ix1,iz1,iy1)
++         p2 = grid%p(ix2,iz2,iy2) + grid%pb(ix2,iz2,iy2)
++         h1 = 0.5*((grid%phb(ix1,iz1,iy1)+grid%ph_2(ix1,iz1,iy1))+(grid%phb(ix1,iz1+1,iy1)+grid%ph_2(ix1,iz1+1,iy1)))/9.81 - grid%ht(ix1,iy1)
++         h2 = 0.5*((grid%phb(ix2,iz2,iy2)+grid%ph_2(ix2,iz2,iy2))+(grid%phb(ix2,iz2+1,iy2)+grid%ph_2(ix2,iz2+1,iy2)))/9.81 - grid%ht(ix2,iy2)
++         p01 = grid%psfc(ix1,iy1)
++         p02 = grid%psfc(ix2,iy2)
++
++         p1 = p1 - p01*(1.0-h1/44300.0)**5.256
++         p2 = p2 - p02*(1.0-h2/44300.0)**5.256
++         grid%precice_pr(id) = p1*(1.0-x0) + p2*x0
++      END IF
++
++      ! interpolate the turbulent kinetic energy
++      IF (grid%precice_write_tke_id .GE. 0) THEN
++         k1 = grid%tke_pbl(ix1,iz1,iy1)
++         k2 = grid%tke_pbl(ix2,iz2,iy2) 
++         grid%precice_tk(id) = k1*(1.0-x0) + k2*x0
++      END IF
++
++      ! inteprolate the turbulence dissipation rate
++      IF (grid%precice_write_epsilon_id .GE. 0) THEN
++         IF (grid%el_pbl(ix1,iz1,iy1) .GT. 0.0) THEN
++            e1 = grid%precice_Cmu**(3.0/4.0) * grid%tke_pbl(ix1,iz1,iy1)**(3.0/2.0) / grid%el_pbl(ix1,iz1,iy1)
++         ELSE
++            e1 = grid%precice_Cmu**(3.0/4.0) * grid%tke_pbl(ix1,iz1,iy1)**(3.0/2.0) / (kappa*10.0)
++         END IF
++
++         IF (grid%el_pbl(ix2,iz2,iy2) .GT. 0.0) THEN
++            e2 = grid%precice_Cmu**(3.0/4.0) * grid%tke_pbl(ix2,iz2,iy2)**(3.0/2.0) / grid%el_pbl(ix2,iz2,iy2)
++         ELSE
++            e2 = grid%precice_Cmu**(3.0/4.0) * grid%tke_pbl(ix2,iz2,iy2)**(3.0/2.0) / (kappa*10.0)
++         END IF
++
++         grid%precice_ep(id) = e1*(1.0-x0) + e2*x0
++      END IF
++
++      ! interpolate the temperature
++      IF (grid%precice_write_temperature_id .GE. 0) THEN
++
++         IF (grid%use_theta_m == 1) THEN
++            t1 = (grid%t_2(ix1,iz1,iy1)+T0)/(1.+R_v/R_d*grid%moist(ix1,iz1,iy1,P_QV)) - T0
++            t2 = (grid%t_2(ix2,iz2,iy2)+T0)/(1.+R_v/R_d*grid%moist(ix2,iz2,iy2,P_QV)) - T0
++         ELSE
++            t1 = grid%t_2(ix1,iz1,iy1)
++            t2 = grid%t_2(ix2,iz2,iy2)
++         END IF
++
++         grid%precice_tp(id) = t1*(1.0-x0) + t2*x0
++      END IF      
++
++      id = id + 1
++
++   END SUBROUTINE wrf_interp
++
++   SUBROUTINE wrf_precice_calc_init_data( grid )
++   
++      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++      ! The subroutine to calculate the wind velocities and potential temperatures at the 
++      ! precice coupling interface based on the simulation of WRF
++      !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++      
++      USE module_domain
++      USE module_dm, ONLY : wrf_dm_min_reals      
++      USE module_configure, ONLY : model_config_rec, grid_config_rec_type, model_to_grid_config_rec
++      USE module_model_constants
++   
++      IMPLICIT NONE
++   
++      ! Arguments
++      TYPE (domain), INTENT(INOUT)           :: grid                  
++      LOGICAL, EXTERNAL                      :: wrf_dm_on_monitor
++   
++      ! external subroutines and functions
++      INTEGER, EXTERNAL                      :: get_unused_unit
++
++      ! Local variables
++      INTEGER                                :: ix, iy, iz, nX, nY, nZ
++      INTEGER                                :: iunit, stat
++      REAL                                   :: u, v, w, t
++      REAL                                   :: curr_pr, curr_ht, curr_p0, curr_tp
++   
++      REAL, PARAMETER                        :: kappa = 0.4
++
++      REAL, DIMENSION(:,:,:), ALLOCATABLE    :: pr, tp, tk, ep, buf
++      REAL, DIMENSION(:,:,:), ALLOCATABLE    :: wu, wv, ww, ws
++
++      CHARACTER(LEN=1024)                    :: message      
++   
++      TYPE (grid_config_rec_type)            :: config_flags
++   
++      !Allocate the arrays for wind components
++         
++#if ( EM_CORE == 1 )
++
++      IF (.NOT. grid%have_calculated_precice_vertices) THEN
++         WRITE( message, * ) '[wrf-precice-error] : ', '[Initialization] : ', 'calculate the vertices before output the initial field'
++         CALL wrf_error_fatal ( message )
++         
++      ELSE
++         
++         nX = CEILING(grid%precice_iloc(2)) - FLOOR(grid%precice_iloc(1)) + 1
++         nY = CEILING(grid%precice_jloc(2)) - FLOOR(grid%precice_jloc(1)) + 1
++         nZ = grid%precice_level + 1
++
++         IF (grid%precice_write_wind_id .GE. 0) THEN
++            ALLOCATE( wu(nX, nY, nZ) )
++            ALLOCATE( wv(nX, nY, nZ) )
++            ALLOCATE( ww(nX, nY, nZ) )
++            ALLOCATE( ws(nX, nY, nZ) )
++         END IF
++
++         IF (grid%precice_write_pressure_id .GE. 0) THEN
++            ALLOCATE( pr(nX, nY, nZ))
++         END IF
++
++         IF (grid%precice_write_tke_id .GE. 0) THEN
++            ALLOCATE( tk(nX, nY, nZ) )
++         END IF
++
++         IF (grid%precice_write_epsilon_id .GE. 0) THEN
++            ALLOCATE( ep(nX, nY, nZ) )
++         END IF
++         
++         IF (grid%precice_write_temperature_id .GE. 0) THEN
++            ALLOCATE( tp(nX, nY, nZ) )
++         END IF
++
++         DO ix = FLOOR(grid%precice_iloc(1)), CEILING(grid%precice_iloc(2))
++            DO iy = FLOOR(grid%precice_jloc(1)), CEILING(grid%precice_jloc(2))
++               DO iz = 1, grid%precice_level + 1
++
++                  IF (grid%sp31 <= ix .AND. ix <= grid%ep31 .AND. grid%sp33 <= iy .AND. iy <= grid%ep33) THEN
++
++                     IF (grid%precice_write_wind_id .GE. 0) THEN
++
++                        IF (config_flags%precice_unstagger_winds) THEN
++
++                           u = ((grid%u_2(ix,iz,iy)*grid%cosa(ix,iy)-grid%v_2(ix,iz,iy)*grid%sina(ix,iy)) + (grid%u_2(ix+1,iz,iy)*grid%cosa(ix+1,iy)-grid%v_2(ix+1,iz,iy)*grid%sina(ix+1,iy)))/2.0 
++                           v = ((grid%v_2(ix,iz,iy)*grid%cosa(ix,iy)+grid%u_2(ix,iz,iy)*grid%sina(ix,iy)) + (grid%v_2(ix,iz,iy+1)*grid%cosa(ix,iy+1)+grid%u_2(ix,iz,iy+1)*grid%sina(ix,iy+1)))/2.0
++                           w = (grid%w_2(ix,iz,iy)+grid%w_2(ix,iz+1,iy))/2.0
++
++                        ELSE
++
++                           u = grid%u_2(ix,iz,iy)*grid%cosa(ix,iy)-grid%v_2(ix,iz,iy)*grid%sina(ix,iy)
++                           v = grid%v_2(ix,iz,iy)*grid%cosa(ix,iy)+grid%u_2(ix,iz,iy)*grid%sina(ix,iy)
++                           w = grid%w_2(ix,iz,iy)
++
++                        END IF
++
++                        wu(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = u
++                        wv(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = v
++                        ww(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = w
++                        ws(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = sqrt(u**2.0+v**2.0+w**2.0)    
++
++                     END IF
++
++                     IF (grid%precice_write_pressure_id .GE. 0) THEN
++                        curr_pr = grid%p(ix,iz,iy) + grid%pb(ix,iz,iy)
++                        curr_p0 = grid%psfc(ix,iy)
++                        curr_ht = 0.5*((grid%phb(ix,iz,iy)+grid%ph_2(ix,iz,iy))+(grid%phb(ix,iz,iy)+grid%ph_2(ix,iz,iy)))/9.81 - grid%ht(ix,iy)
++
++                        pr(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = curr_pr - curr_p0*(1.0-curr_ht/44300.0)**5.256
++                     END IF
++
++                     IF (grid%precice_write_tke_id .GE. 0) THEN
++                        tk(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = grid%tke_pbl(ix,iz,iy) 
++                     END IF
++
++                     IF (grid%precice_write_epsilon_id .GE. 0) THEN
++                        IF (grid%el_pbl(ix,iz,iy) .GT. 0) THEN
++                           ep(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = grid%precice_Cmu**(3.0/4.0) * grid%tke_pbl(ix,iz,iy)**(3.0/2.0) / grid%el_pbl(ix,iz,iy)
++                        ELSE
++                           ep(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = grid%precice_Cmu**(3.0/4.0) * grid%tke_pbl(ix,iz,iy)**(3.0/2.0) / (kappa*10.0)
++                        END IF
++                     END IF
++
++                     IF (grid%precice_write_temperature_id .GE. 0) THEN
++
++                        IF (grid%use_theta_m == 1) THEN
++                           t = (grid%t_2(ix,iz,iy)+T0)/(1.+R_v/R_d*grid%moist(ix,iz,iy,P_QV)) - T0
++                        ELSE
++                           t = grid%t_2(ix,iz,iy)
++                        END IF
++
++                        tp(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = t
++
++                     END IF
++                     
++                  ELSE
++
++                     IF (grid%precice_write_wind_id .GE. 0) THEN
++                        wu(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = 1.E30
++                        wv(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = 1.E30
++                        ww(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = 1.E30
++                     END IF
++                     
++                     IF (grid%precice_write_pressure_id .GE. 0) THEN
++                        pr(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = 1.E30
++                     END IF
++
++                     IF (grid%precice_write_tke_id .GE. 0) THEN
++                        tk(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = 1.E30
++                     END IF
++
++                     IF (grid%precice_write_epsilon_id .GE. 0) THEN
++                        ep(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = 1.E30
++                     END IF
++
++                     IF (grid%precice_write_temperature_id .GE. 0) THEN
++                        tp(ix-FLOOR(grid%precice_iloc(1))+1, iy-FLOOR(grid%precice_jloc(1))+1, iz) = 1.E30
++                     END IF
++
++                  END IF
++
++               END DO
++            END DO
++         END DO
++
++#ifdef DM_PARALLEL
++         ALLOCATE( buf(nX, nY, nZ) )
++
++         IF (grid%precice_write_wind_id .GE. 0) THEN
++            buf(:,:,:) = wu(:,:,:)
++            CALL wrf_dm_min_reals(buf(:,:,:), wu(:,:,:), nX*nY*nZ)
++            
++            buf(:,:,:) = wv(:,:,:)
++            CALL wrf_dm_min_reals(buf(:,:,:), wv(:,:,:), nX*nY*nZ)
++
++            buf(:,:,:) = ww(:,:,:)
++            CALL wrf_dm_min_reals(buf(:,:,:), ww(:,:,:), nX*nY*nZ)
++
++            buf(:,:,:) = ws(:,:,:)
++            CALL wrf_dm_min_reals(buf(:,:,:), ws(:,:,:), nX*nY*nZ)
++         END IF
++
++         IF (grid%precice_write_pressure_id .GE. 0) THEN
++            buf(:,:,:) = pr(:,:,:)
++            CALL wrf_dm_min_reals(buf(:,:,:), pr(:,:,:), nX*nY*nZ)
++         END IF
++
++         IF (grid%precice_write_tke_id .GE. 0) THEN
++            buf(:,:,:) = tk(:,:,:)
++            CALL wrf_dm_min_reals(buf(:,:,:), tk(:,:,:), nX*nY*nZ)
++         END IF
++
++         IF (grid%precice_write_epsilon_id .GE. 0) THEN
++            buf(:,:,:) = ep(:,:,:)
++            CALL wrf_dm_min_reals(buf(:,:,:), ep(:,:,:), nX*nY*nZ)
++         END IF
++
++         IF (grid%precice_write_temperature_id .GE. 0) THEN
++            buf(:,:,:) = tp(:,:,:)
++            CALL wrf_dm_min_reals(buf(:,:,:), tp(:,:,:), nX*nY*nZ)
++         END IF
++
++         DEALLOCATE (buf)
++#endif
++         IF ( wrf_dm_on_monitor() ) THEN
++
++            iunit = get_unused_unit()
++
++            IF ( iunit <= 0 ) THEN
++               WRITE( message, * ) '[wrf-precice-error] : ', '[Initialization] : ', 'Error in wrf_precice_calc_init_data: could not find a free Fortran unit.'               
++               CALL wrf_error_fatal( message )
++            END IF 
++
++            IF (grid%precice_write_wind_id .GE. 0) THEN
++               OPEN(unit=iunit, file=TRIM(grid%init_directory)//'/inputU')
++               CALL write_foam_head(iunit, 'vectorField', 'constant/domainData', 'inputU')
++               WRITE(iunit, '(I6)') nX*nY*nZ
++               WRITE(iunit, '(A)') '('
++               
++               DO ix = 1, nX
++                  DO iy = 1, nY
++                     DO iz = 1, nZ
++                        WRITE(iunit, '(4X, A1, F10.4,X,F10.4,X,F10.4, A1)') '(', wu(ix, iy, iz), wv(ix, iy, iz), ww(ix, iy, iz), ')'
++                     END DO
++                  END DO
++               END DO
++
++               WRITE(iunit, '(A)') ')'
++               CLOSE(unit=iunit)
++
++               DEALLOCATE(wu)
++               DEALLOCATE(wv)
++               DEALLOCATE(ww)
++
++               OPEN(unit=iunit, file=TRIM(grid%init_directory)//'/maxU')
++               WRITE(iunit, '(A, F8.4)') 'maxU : ', maxval(ws) 
++               CLOSE(unit=iunit)
++
++               DEALLOCATE(ws)
++            END IF
++               
++            IF (grid%precice_write_pressure_id .GE. 0) THEN
++               OPEN(unit=iunit, file=TRIM(grid%init_directory)//'/inputP')
++               CALL write_foam_head(iunit, 'scalarField', 'constant/domainData', 'inputP')
++               WRITE(iunit, '(I6)') nX*nY*nZ           
++               WRITE(iunit, '(A)') '('
++               
++               DO ix = 1, nX
++                  DO iy = 1, nY
++                     DO iz = 1, nZ
++                        WRITE(iunit, '(4X, F10.4)') pr(ix, iy, iz)
++                     END DO
++                  END DO
++               END DO
++
++               WRITE(iunit, '(A)') ')'
++               CLOSE(unit=iunit)
++
++               DEALLOCATE(pr)
++            END IF
++
++            IF (grid%precice_write_temperature_id .GE. 0) THEN
++               OPEN(unit=iunit, file=TRIM(grid%init_directory)//'/inputT')
++               CALL write_foam_head(iunit, 'scalarField', 'constant/domainData', 'inputT')
++               WRITE(iunit, '(I6)') nX*nY*nZ              
++               WRITE(iunit, '(A)') '('
++               
++               DO ix = 1, nX
++                  DO iy = 1, nY
++                     DO iz = 1, nZ
++                        WRITE(iunit, '(4X, F10.4)') tp(ix, iy, iz)
++                     END DO
++                  END DO
++               END DO
++
++               WRITE(iunit, '(A)') ')'
++               CLOSE(unit=iunit)
++
++               DEALLOCATE(tp)
++            END IF
++
++            IF (grid%precice_write_tke_id .GE. 0) THEN
++               OPEN(unit=iunit, file=TRIM(grid%init_directory)//'/inputK')
++               CALL write_foam_head(iunit, 'scalarField', 'constant/domainData', 'inputK')
++               WRITE(iunit, '(I6)') nX*nY*nZ              
++               WRITE(iunit, '(A)') '('
++               
++               DO ix = 1, nX
++                  DO iy = 1, nY
++                     DO iz = 1, nZ
++                        WRITE(iunit, '(4X, F10.4)') tk(ix, iy, iz)
++                     END DO
++                  END DO
++               END DO
++
++               WRITE(iunit, '(A)') ')'
++               CLOSE(unit=iunit)
++
++               DEALLOCATE(tk)
++            END IF
++
++            IF (grid%precice_write_epsilon_id .GE. 0) THEN
++               OPEN(unit=iunit, file=TRIM(grid%init_directory)//'/inputEpsilon')
++               CALL write_foam_head(iunit, 'scalarField', 'constant/domainData', 'inputEpsilon')
++               WRITE(iunit, '(I6)') nX*nY*nZ              
++               WRITE(iunit, '(A)') '('
++               
++               DO ix = 1, nX
++                  DO iy = 1, nY
++                     DO iz = 1, nZ
++                        WRITE(iunit, '(4X, F10.6)') ep(ix, iy, iz)
++                     END DO
++                  END DO
++               END DO
++
++               WRITE(iunit, '(A)') ')'
++               CLOSE(unit=iunit)
++
++               DEALLOCATE(ep)
++            END IF 
++
++         END IF
++      
++      END IF
++#endif
++   
++   END SUBROUTINE wrf_precice_calc_init_data
++         
++   SUBROUTINE wrf_precice_initialize_advance( grid, time_step )
++   
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   ! The main subroutine for advancing the time step for the precice coupled simulation
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!   
++   
++      USE module_domain
++      USE module_configure, ONLY : model_config_rec, grid_config_rec_type, model_to_grid_config_rec
++      USE module_model_constants
++   
++      IMPLICIT NONE
++   
++      ! Arguments
++      TYPE (domain), INTENT(INOUT)                       :: grid
++      REAL, INTENT(IN)                                   :: time_step
++
++      LOGICAL, EXTERNAL                                  :: wrf_dm_on_monitor
++   
++      ! Local variables
++      INTEGER                                            :: flag_write_data
++      INTEGER                                            :: ii, rc, precice_ongoning
++      INTEGER, PARAMETER                                 :: precision = 100
++      INTEGER                                            :: dt, dt_num, dt_den
++      REAL                                               :: xmins
++      TYPE(WRFU_TimeInterval)                            :: tmpTimeInterval
++      DOUBLE PRECISION                                   :: wrf_time_step, precice_time_step
++      CHARACTER(LEN=50)                                  :: precice_write_check_point
++      CHARACTER(LEN=1024)                                :: message
++      DOUBLE PRECISION, ALLOCATABLE, DIMENSION(:)        :: Velocity, Pressure, Temperature, TKE, EPS
++
++      CALL domain_clock_get(grid, minutesSinceSimulationStart = xmins)
++
++      IF (xmins > grid%precice_xmins ) THEN
++
++         IF (.NOT. grid%precice_initialized) THEN
++            
++            IF (grid%write_init) THEN           
++               CALL wrf_precice_calc_init_vertices( grid ) 
++               CALL wrf_precice_calc_init_data( grid )
++            END IF
++
++            CALL precicef_initialize( precice_time_step )
++            wrf_time_step = DBLE(time_step)
++
++            IF ((precice_time_step .LT. wrf_time_step) ) THEN
++
++               dt = NINT(precice_time_step)
++               dt_den = precision
++               dt_num = NINT((precice_time_step-DBLE(dt)) * precision)
++
++               CALL WRFU_TimeIntervalSet(tmpTimeInterval, S=dt, Sn=dt_num, Sd=dt_den, rc=rc)
++
++               IF ( rc /= WRFU_SUCCESS ) THEN
++                  CALL wrf_error_fatal ( '[wrf-precice-error] :  [coupling] : WRFU_TimeIntervalSet failed in precice intialization' )
++               ENDIF
++
++               grid%dt = precice_time_step
++               CALL WRFU_ClockSet(grid%domain_clock,  timeStep=tmpTimeInterval, rc=rc)
++
++               IF ( rc /= WRFU_SUCCESS ) THEN
++                  CALL wrf_error_fatal ('[wrf-precice-error] :  [coupling] : WRFU_ClockSet failed in precice intialization' )
++               ENDIF
++
++            END IF
++
++            grid%precice_initialized = .TRUE.
++               
++         END IF
++
++         precice_ongoning = 1
++         CALL precicef_is_coupling_ongoing(precice_ongoning)
++
++         IF ( precice_ongoning .NE. 0 ) THEN
++
++            WRITE(message, '(A)') '[wrf-precice-info] : [coupling] : Advancing the time step for precice coupling' 
++            CALL wrf_message(message) 
++
++            precice_write_check_point = '                                                  '
++            CALL precicef_is_action_required(precice_write_check_point, flag_write_data)
++         
++            IF (flag_write_data .EQ. 1) THEN
++               CALL precicef_mark_action_fulfilled( precice_write_check_point )
++            END IF
++            
++            CALL precicef_is_write_data_required(time_step, flag_write_data)
++         
++            IF (flag_write_data .EQ. 1) THEN
++
++               WRITE(message, '(A, I3, A)') '[wrf-precice-info] : [coupling] domian id : ', grid%id, ' calculating the exchange data for the precice coupling'
++               CALL wrf_message(message)
++
++               CALL wrf_precice_calc_data( grid )          
++
++               IF (grid%precice_write_wind_id .GE. 0)  THEN
++
++                  ALLOCATE( Velocity(grid%precice_interface_number_vertices*3) )
++
++                  DO ii = 1, grid%precice_interface_number_vertices
++                     Velocity(3*(ii-1)+1) = grid%precice_wu(ii)
++                     Velocity(3*(ii-1)+2) = grid%precice_wv(ii)
++                     Velocity(3*(ii-1)+3) = grid%precice_ww(ii)
++                  END DO
++            
++                  CALL precicef_write_bvdata(grid%precice_write_wind_id, grid%precice_interface_number_vertices, &
++                                             grid%precice_interface_vertex_ids, Velocity)
++
++                  WRITE(message, '(A)') '[wrf-precice-info] : [coupling] : writing the velocity data for the precice coupling'
++                  CALL wrf_message(message)                                            
++               END IF
++
++               IF (grid%precice_write_pressure_id .GE. 0 ) THEN
++
++                  ALLOCATE( Pressure(grid%precice_interface_number_vertices) )
++
++                  DO ii = 1, grid%precice_interface_number_vertices
++                     Pressure(ii) = grid%precice_pr(ii)
++                  END DO
++
++                  CALL precicef_write_bsdata(grid%precice_write_pressure_id, grid%precice_interface_number_vertices, &
++                                             grid%precice_interface_vertex_ids, Pressure)    
++
++                  WRITE(message, '(A)') '[wrf-precice-info] : [coupling] : writing the pressure data for the precice coupling'
++                  CALL wrf_message(message)                                               
++               END IF    
++               
++               IF (grid%precice_write_tke_id .GE. 0) THEN
++                  
++                  ALLOCATE( TKE(grid%precice_interface_number_vertices) )
++
++                  DO ii = 1, grid%precice_interface_number_vertices
++                     TKE(ii) = grid%precice_tk(ii)
++                  END DO
++
++                  CALL precicef_write_bsdata(grid%precice_write_tke_id, grid%precice_interface_number_vertices, &
++                                             grid%precice_interface_vertex_ids, TKE)
++
++                  WRITE(message, '(A)') '[wrf-precice-info] : [coupling] : writing the tke data for the precice coupling'
++                  CALL wrf_message(message)                                                                
++               END IF
++                     
++               IF (grid%precice_write_epsilon_id .GE. 0) THEN
++                  
++                  ALLOCATE( EPS(grid%precice_interface_number_vertices) )
++
++                  DO ii = 1, grid%precice_interface_number_vertices
++                     EPS(ii) = grid%precice_ep(ii)
++                  END DO
++
++                  CALL precicef_write_bsdata(grid%precice_write_epsilon_id, grid%precice_interface_number_vertices, &
++                                             grid%precice_interface_vertex_ids, EPS)
++
++                  WRITE(message, '(A)') '[wrf-precice-info] : [coupling] : writing the epsilon data for the precice coupling'
++                  CALL wrf_message(message)                                                                
++               END IF
++
++               IF (grid%precice_write_temperature_id .GE. 0) THEN
++
++                  ALLOCATE( Temperature(grid%precice_interface_number_vertices) )
++
++                  DO ii = 1, grid%precice_interface_number_vertices
++                     Temperature(ii) = grid%precice_tp(ii)
++                  END DO
++
++                  CALL precicef_write_bsdata(grid%precice_write_temperature_id, grid%precice_interface_number_vertices, &
++                                             grid%precice_interface_vertex_ids, Temperature)
++
++                  WRITE(message, '(A)') '[wrf-precice-info] : [coupling] : writing the temperature data for the precice coupling'
++                  CALL wrf_message(message)    
++
++               END IF                               
++         
++            ENDIF
++            
++            wrf_time_step = DBLE(time_step)
++            precice_time_step = DBLE(time_step)
++
++            CALL precicef_advance( precice_time_step )
++            CALL precicef_is_coupling_ongoing( precice_ongoning )
++
++            IF ((precice_time_step .LT. wrf_time_step) .AND. (precice_ongoning .NE. 0)) THEN
++
++               dt = NINT(precice_time_step)
++               dt_den = precision
++               dt_num = NINT((precice_time_step-DBLE(dt)) * precision)
++
++               CALL WRFU_TimeIntervalSet(tmpTimeInterval, S=dt, Sn=dt_num, Sd=dt_den, rc=rc)
++
++               IF ( rc /= WRFU_SUCCESS ) THEN
++                  CALL wrf_error_fatal ( '[wrf-precice-error] : [coupling] : WRFU_TimeIntervalSet failed in precice advancing' )
++               ENDIF
++
++               grid%dt = precice_time_step
++               CALL WRFU_ClockSet(grid%domain_clock,  timeStep=tmpTimeInterval, rc=rc)
++
++               IF ( rc /= WRFU_SUCCESS ) THEN
++                  CALL wrf_error_fatal ('[wrf-precice-error] : [coupling] : WRFU_TimeIntervalSet failed in precice advancing' )
++               ENDIF
++
++            END IF
++
++            IF (flag_write_data .EQ. 1) THEN
++
++               IF (grid%precice_write_wind_id .GE. 0) DEALLOCATE(Velocity)
++               IF (grid%precice_write_pressure_id .GE. 0) DEALLOCATE(Pressure)
++               IF (grid%precice_write_tke_id .GE. 0) DEALLOCATE(TKE)
++               IF (grid%precice_write_epsilon_id .GE. 0) DEALLOCATE(EPS)
++               IF (grid%precice_write_temperature_id .GE. 0) DEALLOCATE(Temperature)                                    
++            
++            END IF
++
++         ELSE
++
++            CALL wrf_precice_finalize( grid )
++
++         END IF
++
++      END IF
++      
++   END SUBROUTINE wrf_precice_initialize_advance
++   
++   SUBROUTINE wrf_precice_finalize( grid )
++   
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   ! The subroutine to finalize the precice coupled simulation
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!   
++   
++      USE module_domain
++      USE module_configure, ONLY : model_config_rec, grid_config_rec_type, model_to_grid_config_rec
++      USE module_model_constants
++   
++      IMPLICIT NONE
++   
++      ! Arguments
++      TYPE (domain), INTENT(INOUT)           :: grid
++
++      ! Local
++      CHARACTER(LEN=1024)                    :: message
++
++      WRITE(message, '(A)') '[wrf-precice-info] :  [finalizing] : finalizing the precice coupling to end the simualtion'
++      CALL wrf_message(message)
++   
++      DEALLOCATE( grid%precice_interface_vertices )
++      DEALLOCATE( grid%precice_interface_vertex_ids )
++
++      IF (grid%precice_write_wind_id .GE. 0) THEN
++         DEALLOCATE( grid%precice_wu )
++         DEALLOCATE( grid%precice_wv )
++         DEALLOCATE( grid%precice_ww )
++      END IF
++
++      IF (grid%precice_write_pressure_id .GE. 0) THEN
++         DEALLOCATE( grid%precice_pr )
++      END IF
++
++      IF (grid%precice_write_tke_id .GE. 0) THEN
++         DEALLOCATE( grid%precice_tk )
++      END IF
++
++      IF (grid%precice_write_epsilon_id .GE. 0) THEN
++         DEALLOCATE( grid%precice_ep )
++      END IF
++
++      IF (grid%precice_write_temperature_id .GE. 0) THEN
++         DEALLOCATE( grid%precice_tp )
++      END IF
++   
++      grid%precice_finalized = .TRUE.
++      
++      CALL precicef_finalize()
++   
++   END SUBROUTINE wrf_precice_finalize
++
++   SUBROUTINE write_foam_head (unit, kind, location, object)
++
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++   ! Auxiliary function to write the head information for OpenFOAM
++   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!      
++      IMPLICIT NONE
++
++      INTEGER, INTENT(IN)                 :: unit
++      CHARACTER(LEN=*), INTENT(IN)        :: kind, location, object
++
++      WRITE(unit, '(A)') '/*--------------------------------*- C++ -*----------------------------------*|'
++      WRITE(unit, '(A)') '| \      /  F ield         | OpenFOAM: The Open Source CFD Toolbox            |'
++      WRITE(unit, '(A)') '|  \    /   O peration     | Version:  4.0                                    |'
++      WRITE(unit, '(A)') '|   \  /    A nd           | Web:      www.OpenFOAM.org                       |'
++      WRITE(unit, '(A)') '\*---------------------------------------------------------------------------*/'
++
++      WRITE(unit, '(A)') 'FoamFile '
++      WRITE(unit, '(A)') '{ '
++      WRITE(unit, '(A)') '    version     2.0;'
++      WRITE(unit, '(A)') '    format      ascii;'
++      WRITE(unit, '(A, A, A)') '    class       ', TRIM(kind), ';'
++      WRITE(unit, '(A, A, A)') '    location    ', TRIM(location), ';'
++      WRITE(unit, '(A, A, A)') '    object      ', TRIM(object), ';'
++      WRITE(unit, '(A)') '} '
++
++      WRITE(unit, '(A)') '// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //'
++
++   END SUBROUTINE
+\ 文件尾没有换行符

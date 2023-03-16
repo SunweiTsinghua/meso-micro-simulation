@@ -1,0 +1,33 @@
+--- configure	2023-03-15 16:36:09.649186432 +0800
++++ ../wrf/configure	2023-03-15 17:01:17.605468199 +0800
+@@ -208,6 +208,13 @@
+   exit 5
+ fi
+ 
++if [ -z "$USEPRECICE" ]; then
++  read -p "compilation with the precice coupling enabled ? (1=disable, 2=enable) [default 1] : " enablePrecice
++  if [ $enablePrecice = "2" ]; then
++    export USEPRECICE=True
++  fi
++fi
++
+ if  test -z "$NETCDF_classic"  ; then
+   export NETCDF4=1
+ else
+@@ -684,6 +691,16 @@
+   fi
+ fi
+ 
++if [ -n "$USEPRECICE" ]; then
++  echo "adjust the configure.wrf to have the precice coupling enabled"
++  PRECICE_CFLAG=`pkg-config --cflags libprecice`
++  PRECICE_LIB=`pkg-config --libs   libprecice`
++  sed -e "s@CFLAGS_LOCAL    =       @CFLAGS_LOCAL    =       $PRECICE_CFLAG @" \
++      -e "s@LDFLAGS_LOCAL   =       @LDFLAGS_LOCAL   =       $PRECICE_LIB @" \
++      -e "s@LIB_EXTERNAL    = @LIB_EXTERNAL    =  $PRECICE_LIB@" configure.wrf > configure.precice
++  /bin/mv configure.precice configure.wrf
++fi 
++
+ #Checking cross-compiling capability for some particular environment 
+ #on Linux and Mac box
+ 
