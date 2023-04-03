@@ -1,0 +1,19 @@
+this repository contains a tutorial case to run the WOCSS, which combines the simulations of WRF and OpenFOAM to show the wind environmnet in the urban boundary layer
+In the framework of WOCSS, the simulations of WRF and OpenFOAM are run in parallel and the data of wind velocities, pressures, turbulent kinetic energy and its dissipation rates from the WRF model are ported into the OpenFOAM simulation as boundary and initial conditions. In other words, the WOCCS implements a one-way nesting for downscale the simulation at the meso-scale by WRF to the simulation at the micro-scale by OpenFOAM.
+the tutorial is essentially a case study showing the urban wind environment within a residential quarter in Shenzhen, China during the period of Jan 20th, 8:00-9:00 in 2020.
+the toturial is run automatically through executing the python script, and therefore requires the following python packages to be installed before running the python code
+1. PyFoam with verion > 1.6
+2. f90nml
+3. NetCDF
+
+the running of the tutorial is governed by the json file stored in the /script/tut_control.json directory under the root directory of the tutorial
+while the other settings should kept unchanged, the user are required to give the path where the executables of WPS and WRF are found
+
+after installing the required packages of python and adjust settings of the control json, the tutorial can be run by simply type 
+python3 tut.py
+
+and the simulation results correspondng to the WRF and OpenFOAM can be found in WRF_run and foam_run directories within the root directory of the tutorial
+
+it is noted that the behaviours of the WOCCS simulation regarding the coupled behaviour are controlled by the precice.nml and preciceDict, all three files can be found in the template directory under the root directory of the tutorial and the explannations of the settings can be found in the following files together with this README
+1. preciceDict.explannation
+2. precice.nml.explannation

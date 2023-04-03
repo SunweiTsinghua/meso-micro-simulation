@@ -1,0 +1,20 @@
+# --------- precice coupling control file --------------#
+&precice_config
+    init_directory = '' ! the directory to write down the initial conditions to speed up the foam simulation to be compatible with WRF run
+    mesh_name = 'WRF-Mesh' ! the name of WRF mesh, should not be changed
+    num_data = 3 ! the numner of data exchanged through the precice interface, currently 3 variables in tutorial (Velocity, TKE and epsilon)
+    participant_name = 'WRF' ! the name of WRF participant, should not be changed
+    write_init = .true. ! whether to write the initial conditions for the foam run
+    xml_name = '../precice.nml' ! the name of the XML file controls the WOCSS run 
+/
+&coupling_config
+    cmu = 0.09 ! the Cmu parameter in the common two-equation turbulence model
+    cornerx = -3000.0, 3000.0 ! the coordinates of the corners for WRF-OpenFOAM coupled simulation, using the foam coordinate system
+    cornery = -3000.0, 3000.0 ! the coordinates of the corners for WRF-OpenFOAM coupled simulation, using the foam coordinate system
+    exchange_data = 'Velocity', 'TKE', 'DissipationRate' ! the name of the coupled data, should not be changed
+    has_lid = .false. ! whether to inlude a lid for the precice-coupled simulation
+    height = 500.0 ! the height of the precice-coupled WRF-OpenFOAM domain 
+    lats = 42.56, 42.622 ! the latitudes of the precice-coupled WRF-OpenFOAM domain south-north corners
+    lons = 88.827, 88.923 ! the longtitudes of the precice-coupled WRF-OpenFOAM domain east-west corners
+    start_mins = 2.0 ! the time in WRF simulation after which the WOCCS start to run the joint simulation
+/

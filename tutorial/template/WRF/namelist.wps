@@ -1,0 +1,38 @@
+&share
+ wrf_core = 'ARW',
+ max_dom = 5,
+ start_date = '2006-08-16_12:00:00',
+ end_date   = '2006-08-16_18:00:00',
+ interval_seconds = 21600
+ io_form_geogrid = 2,
+/
+
+&geogrid
+ parent_id         =   0,       1,      2,      3,      4,
+ parent_grid_ratio =   1,       3,      3,      3,      3,
+ i_parent_start    =   1,       6,      6,      7,      8,
+ j_parent_start    =   1,       6,      6,      7,      8,
+ e_we              =   17,      19,     25,     37,     67,
+ e_sn              =   17,      19,     25,     37,     67,       
+
+ geog_data_res = 'default','default', 'default', 'default'
+ dx = 8100,
+ dy = 8100,
+ map_proj = 'lambert',
+ ref_lat   =  34.83,
+ ref_lon   = -81.03,
+ truelat1  =  30.0,
+ truelat2  =  60.0,
+ stand_lon = -98.0,
+ geog_data_path = '/home/sunwei/WRF/GeoData/WPS_GEOG'
+/
+
+&ungrib
+ out_format = 'WPS',
+ prefix = 'FILE',
+/
+
+&metgrid
+ fg_name = 'FILE'
+ io_form_metgrid = 2, 
+/

@@ -1,0 +1,36 @@
+{
+  "start_date_time" : "",
+  "end_date_time" : "",
+  "case_directory": "..",  
+  "wps_directory" : "the full path to the wps executables (geogrid.exe, ungrib.exe, metgrid.exe) from the WPS installation",
+  "wrf_directory" : "the full path to the wrf executables (real.exe, wrf.exe) from the WRF installation",
+  "mesh_directory" : "../mesh",
+  "geo_directory" : "the full path to the geostatic data downloaded from the WRF website",
+  "template_directory": "../template",  
+
+  "downloaded_era5" : 1,
+
+  "foam_mesh" : 0,
+  "min_mesh_size" : 10.0,
+  "number_process": 4,
+  "foam_time_step" : 0.1,
+  "foam_output_interval" : 5.0,
+  "foam_set_patches" : ["interface", "top"], 
+  "foam_interface" : ["interface"],
+
+  "precice_height" : 500.0,
+  "precice_Cmu" : 0.09,
+  "precice_write_init" : 1,
+  "precice_wrf_start_mins" : 2.0,
+  "precice_lid" : 0,
+
+  "precice_exchange_data" : 
+  [
+      {"type" : "vector", "name" : "Velocity" },
+      {"type" : "scalar", "name" : "TKE" },
+      {"type" : "scalar", "name" : "DissipationRate" }
+  ], 
+
+  "exchange_maxTime" : 121.0,
+  "exchange_timeStep" : 0.0
+}
